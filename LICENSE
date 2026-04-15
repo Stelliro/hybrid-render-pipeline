@@ -66,6 +66,7 @@ work by Stelliro and require attribution when used:
   - Sparse Voxel Radiance Marching (SVRM) with Depth-Gap Bridging
   - GTAO+ Dual-Horizon Multi-Scale AO with Bent Normals
   - Camera-Ray Shadow Segmentation for World-Anchored Volumetrics
+  - Orientation Anchor System (6-Point Surface Capture)
   - Biome-Aware Per-Pixel Lighting Profiles
   - Hybrid Forward+Compute Pipeline Architecture
 

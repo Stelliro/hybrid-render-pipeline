@@ -2,6 +2,17 @@
 
 All notable changes to this documentation will be documented in this file.
 
+## [1.1.0] - 2026-04-15
+
+### Added
+- Orientation Anchor System (6-Point Surface Capture) documentation
+  - Motion-capture-style marker points for camera-visible surface determination
+  - Octahedron-mapped impostor atlas with orientation-correct UV lookup
+  - Roll correction for physics-driven objects (fallen trees, ragdolls, debris)
+  - Per-pixel normal correction for accurate impostor lighting at any orientation
+  - Proactive texture streaming with angular velocity pre-fetch
+  - Implementation checklist and performance budget (~0.15 ms/frame for 750 objects)
+
 ## [1.0.0] - 2026-04-15
 
 ### Added

@@ -21,11 +21,15 @@ keywords:
   - volumetric-lighting
   - game-engine
   - real-time-rendering
+  - impostor-rendering
+  - orientation-anchors
 abstract: >
   A novel rendering architecture combining forward geometry passes with
   compute-based screen-space lighting for cinematic open-world games.
   Introduces Sparse Voxel Radiance Marching (SVRM) for probe-grid
   screen-space GI with Depth-Gap Bridging, GTAO+ dual-horizon multi-scale
-  ambient occlusion with bent normals, and camera-ray shadow segmentation
-  for world-anchored volumetric god rays. Targets 60 FPS on mid-range
-  GPUs (GTX 1060 class) at 1080p.
+  ambient occlusion with bent normals, camera-ray shadow segmentation
+  for world-anchored volumetric god rays, and the Orientation Anchor
+  System (6-Point Surface Capture) for motion-capture-style impostor
+  rendering with orientation-correct lighting and proactive texture
+  streaming. Targets 60 FPS on mid-range GPUs (GTX 1060 class) at 1080p.
