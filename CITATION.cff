@@ -1,0 +1,31 @@
+# CITATION.cff — Machine-readable citation metadata
+# See https://citation-file-format.github.io/
+
+cff-version: 1.2.0
+title: "Hybrid Forward+Compute Render Pipeline"
+message: "If you use this rendering architecture, please cite it using this metadata."
+type: software
+authors:
+  - alias: Stelliro
+    orcid: ""
+repository-code: "https://github.com/Stelliro/hybrid-render-pipeline"
+license: CC-BY-SA-4.0
+version: "1.0.0"
+date-released: "2026-04-15"
+keywords:
+  - rendering
+  - vulkan
+  - compute-shaders
+  - screen-space-gi
+  - ambient-occlusion
+  - volumetric-lighting
+  - game-engine
+  - real-time-rendering
+abstract: >
+  A novel rendering architecture combining forward geometry passes with
+  compute-based screen-space lighting for cinematic open-world games.
+  Introduces Sparse Voxel Radiance Marching (SVRM) for probe-grid
+  screen-space GI with Depth-Gap Bridging, GTAO+ dual-horizon multi-scale
+  ambient occlusion with bent normals, and camera-ray shadow segmentation
+  for world-anchored volumetric god rays. Targets 60 FPS on mid-range
+  GPUs (GTX 1060 class) at 1080p.
