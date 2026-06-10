@@ -198,9 +198,11 @@ void main()
         float grain = hash12(uv * params.screenParams.xy, params.compositeParams.w);
         grain = (grain - 0.5) * grainStrength;
 
-        // Apply more grain in darker areas (perceptually correct)
+        // Suppress grain in deep shadow so night scenes read as flat darkness
+        // with clean silhouettes instead of crawling static. Grain ramps in
+        // over [0.06, 0.30] luminance — invisible at night, full in lit areas.
         float baseLum = dot(baseColor, vec3(0.2126, 0.7152, 0.0722));
-        float grainWeight = mix(1.0, 0.3, smoothstep(0.0, 0.5, baseLum));
+        float grainWeight = smoothstep(0.06, 0.30, baseLum);
         baseColor += vec3(grain) * grainWeight;
     }
 
