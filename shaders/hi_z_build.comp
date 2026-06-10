@@ -1,0 +1,50 @@
+/// @file hi_z_build.comp
+/// @brief Builds a hierarchical depth (Hi-Z) pyramid via max-reduction.
+///
+/// Each dispatch reads from mip level N and writes the max of a 2×2 texel
+/// block to mip level N+1. This creates a conservative depth pyramid where
+/// each texel at mip M represents the maximum (farthest) depth in its
+/// corresponding screen region.
+///
+/// Used by: screen_space_gi.comp, hi_z_reflections.comp, gtao_plus.comp
+///          for O(log n) ray marching through the depth buffer.
+///
+/// Dispatch: (ceil(dstWidth/8), ceil(dstHeight/8), 1) per mip level.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Source mip level (read)
+layout(set = 0, binding = 0) uniform sampler2D srcDepth;
+
+// Destination mip level (write)
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dstDepth;
+
+layout(push_constant) uniform HiZParams {
+    vec4 srcSize;   // x = srcWidth, y = srcHeight, z = 1/srcWidth, w = 1/srcHeight
+} params;
+
+void main()
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dstDepth);
+
+    if (pos.x >= dstSize.x || pos.y >= dstSize.y)
+        return;
+
+    // Sample 4 texels from the source mip using bilinear-compatible coords
+    vec2 srcTexelSize = vec2(params.srcSize.z, params.srcSize.w);
+    vec2 uv = (vec2(pos) * 2.0 + 1.0) * srcTexelSize;
+
+    // Gather the 2×2 block from the source mip
+    float d00 = textureLod(srcDepth, uv + vec2(-0.5, -0.5) * srcTexelSize, 0.0).r;
+    float d10 = textureLod(srcDepth, uv + vec2( 0.5, -0.5) * srcTexelSize, 0.0).r;
+    float d01 = textureLod(srcDepth, uv + vec2(-0.5,  0.5) * srcTexelSize, 0.0).r;
+    float d11 = textureLod(srcDepth, uv + vec2( 0.5,  0.5) * srcTexelSize, 0.0).r;
+
+    // Max reduction — conservative for occlusion testing
+    float maxDepth = max(max(d00, d10), max(d01, d11));
+
+    imageStore(dstDepth, pos, vec4(maxDepth, 0.0, 0.0, 0.0));
+}

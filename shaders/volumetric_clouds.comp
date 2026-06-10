@@ -1,0 +1,511 @@
+/// @file volumetric_clouds.comp
+/// @brief Compute shader — dedicated volumetric cloud ray marcher.
+///
+/// High-quality cloud rendering using multi-octave 3D noise (Perlin + Worley
+/// hybrid), weather-driven coverage, height-gradient cloud shaping per cloud
+/// type, energy-conserving in-scattering with multi-scatter approximation
+/// (powder effect), Beer-Lambert extinction, and temporal blue-noise offset.
+///
+/// Outputs a half-resolution 2D texture:
+///   RGB = accumulated in-scattered cloud light
+///   A   = total transmittance through the cloud layer
+///
+/// The composite stage applies: finalColor = sceneColor * cloudTransmittance + cloudScattering.
+///
+/// Reads: CloudUBO (set 0, binding 0), depth buffer (set 0, binding 1).
+/// Writes: 2D cloud texture (set 0, binding 2) — RGBA16F.
+///
+/// Dispatch: (ceil(width/8), ceil(height/8), 1) at half resolution.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ── UBO: cloud rendering parameters from VolumetricClouds system ─────
+layout(set = 0, binding = 0) uniform CloudUBO {
+    // Camera
+    mat4  invViewProj;
+    vec3  cameraPos;
+    float nearPlane;
+    float farPlane;
+    float _pad0[3];
+
+    // Sun
+    vec3  sunDirection;
+    float sunIntensity;
+    vec3  sunColor;
+    float _pad1;
+
+    // Cloud layer geometry
+    float cloudCoverage;     // [0,1] how much of the sky is filled
+    float cloudDensity;      // optical thickness multiplier
+    float cloudBaseHeight;   // bottom of layer (meters)
+    float cloudTopHeight;    // top of layer (meters)
+
+    // Cloud motion
+    vec2  cloudWindOffset;   // cumulative wind drift (XZ)
+    float cloudNoiseScale;   // base noise frequency
+    float cloudErosion;      // detail erosion strength
+
+    // Cloud type and weather
+    float cloudType;         // 0=Cumulus, 1=Stratus, 2=Cirrus, 3=Cumulonimbus, 4=Nimbostratus, 5=Fog
+    float precipitation;     // [0,1] rain/snow intensity
+    float time;              // global animation time
+    float dayProgress;       // [0,1] time of day
+
+    // Wind
+    vec2  windDirection;
+    float windStrength;
+    float mieAnisotropy;     // Henyey-Greenstein g parameter
+
+    // Scattering
+    vec3  ambientColor;
+    float rayleighCoeff;
+
+    // Screen
+    float screenWidth;
+    float screenHeight;
+    float frameIndex;        // for temporal jitter
+    float _pad2;
+} ubo;
+
+// ── Depth buffer (full resolution) ──────────────────────────────────
+layout(set = 0, binding = 1) uniform sampler2D depthBuffer;
+
+// ── Output: 2D cloud texture (scattering RGB, transmittance A) ──────
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D cloudTexture;
+
+// ══════════════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════════════
+
+const float PI       = 3.14159265358979;
+const float INV_4PI  = 1.0 / (4.0 * PI);
+
+// Ray march settings
+const int   PRIMARY_STEPS     = 64;   // Main ray march steps through cloud layer
+const int   LIGHT_STEPS       = 6;    // Steps toward sun for in-shadow density
+const float LIGHT_MARCH_LEN   = 40.0; // Total light march distance (meters)
+
+// Cloud density scaling
+const float DENSITY_MULT      = 0.04; // Global density coefficient
+const float ABSORPTION_COEFF  = 0.04; // Beer-Lambert absorption
+
+// Silver lining / multi-scatter approximation
+const float POWDER_STRENGTH   = 2.0;
+const float SILVER_INTENSITY  = 0.25;
+const float SILVER_SPREAD     = 0.15;
+
+// Ambient contribution at night vs day
+const float AMBIENT_MIN       = 0.015;
+const float AMBIENT_MAX       = 0.12;
+
+// ══════════════════════════════════════════════════════════════════════
+// Hash & noise functions
+// ══════════════════════════════════════════════════════════════════════
+
+/// Single-value hash.
+float hash11(float p)
+{
+    p = fract(p * 0.1031);
+    p *= p + 33.33;
+    p *= p + p;
+    return fract(p);
+}
+
+/// 3D → 1D hash.
+float hash31(vec3 p)
+{
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+/// 3D value noise (Hermite-smoothed).
+float valueNoise3D(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n000 = hash31(i);
+    float n100 = hash31(i + vec3(1,0,0));
+    float n010 = hash31(i + vec3(0,1,0));
+    float n110 = hash31(i + vec3(1,1,0));
+    float n001 = hash31(i + vec3(0,0,1));
+    float n101 = hash31(i + vec3(1,0,1));
+    float n011 = hash31(i + vec3(0,1,1));
+    float n111 = hash31(i + vec3(1,1,1));
+
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+
+/// Worley noise (cellular noise) — returns distance to closest feature point.
+float worleyNoise3D(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+
+    float minDist = 1.0;
+
+    for (int x = -1; x <= 1; x++)
+    for (int y = -1; y <= 1; y++)
+    for (int z = -1; z <= 1; z++)
+    {
+        vec3 neighbor = vec3(float(x), float(y), float(z));
+        vec3 point = vec3(hash31(i + neighbor),
+                          hash31(i + neighbor + 31.17),
+                          hash31(i + neighbor + 73.51));
+        vec3 diff = neighbor + point - f;
+        float dist = dot(diff, diff);
+        minDist = min(minDist, dist);
+    }
+
+    return sqrt(minDist);
+}
+
+/// FBM with value noise for large-scale shape.
+float fbmPerlin(vec3 p, int octaves)
+{
+    float value = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+
+    for (int i = 0; i < octaves; i++) {
+        value += amp * valueNoise3D(p * freq);
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    return value;
+}
+
+/// FBM with Worley noise for detail erosion.
+float fbmWorley(vec3 p, int octaves)
+{
+    float value = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+
+    for (int i = 0; i < octaves; i++) {
+        value += amp * worleyNoise3D(p * freq);
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    return value;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Phase functions
+// ══════════════════════════════════════════════════════════════════════
+
+/// Henyey-Greenstein phase function.
+float phaseHG(float cosTheta, float g)
+{
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return INV_4PI * (1.0 - g2) / (denom * sqrt(max(denom, 0.0001)));
+}
+
+/// Dual-lobe phase for clouds: forward + backward scattering.
+/// Produces silver lining effect when looking toward the sun.
+float cloudPhase(float cosTheta, float g)
+{
+    float forward  = phaseHG(cosTheta, g);
+    float backward = phaseHG(cosTheta, -g * 0.3);
+    float silver   = phaseHG(cosTheta, 0.99 - SILVER_SPREAD);
+    return mix(forward, backward, 0.25) + SILVER_INTENSITY * silver;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Height gradient per cloud type
+// ══════════════════════════════════════════════════════════════════════
+
+/// Returns a density multiplier based on normalized height [0,1] within cloud layer.
+/// Different cloud types have different vertical density profiles.
+float cloudHeightGradient(float normalizedHeight, float type)
+{
+    // Cumulus: round, puffy — dense in lower 2/3, thin top
+    float cumulus = smoothstep(0.0, 0.12, normalizedHeight)
+                  * smoothstep(1.0, 0.55, normalizedHeight);
+    // Emphasize rounded anvil top
+    cumulus *= 1.0 + 0.3 * smoothstep(0.3, 0.5, normalizedHeight)
+                         * smoothstep(0.65, 0.5, normalizedHeight);
+
+    // Stratus: flat, uniform — thin sheet across full height
+    float stratus = smoothstep(0.0, 0.05, normalizedHeight)
+                  * smoothstep(1.0, 0.85, normalizedHeight);
+
+    // Cirrus: wispy tendrils at top — density concentrated near top
+    float cirrus = smoothstep(0.4, 0.7, normalizedHeight)
+                 * smoothstep(1.0, 0.9, normalizedHeight);
+
+    // Cumulonimbus: towering storm — dense through entire range, anvil top
+    float cumulonimbus = smoothstep(0.0, 0.05, normalizedHeight)
+                       * smoothstep(1.0, 0.92, normalizedHeight);
+    cumulonimbus *= 1.0 + 0.4 * smoothstep(0.7, 0.85, normalizedHeight)
+                              * smoothstep(1.0, 0.92, normalizedHeight);
+
+    // Nimbostratus: thick rain-bearing layer — uniform but dense
+    float nimbostratus = smoothstep(0.0, 0.08, normalizedHeight)
+                       * smoothstep(1.0, 0.75, normalizedHeight)
+                       * 1.3;
+
+    // Fog: ground-hugging — strongest at bottom, rapid falloff
+    float fog = smoothstep(1.0, 0.0, normalizedHeight) * 0.6;
+
+    // Blend based on cloud type float
+    if (type < 0.5) return cumulus;
+    if (type < 1.5) return stratus;
+    if (type < 2.5) return cirrus;
+    if (type < 3.5) return cumulonimbus;
+    if (type < 4.5) return nimbostratus;
+    return fog;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Cloud density sampling
+// ══════════════════════════════════════════════════════════════════════
+
+/// Sample cloud density at a world-space position.
+/// Returns [0, ~1] density value (0 = clear sky).
+float sampleCloudDensity(vec3 worldPos, bool cheapSample)
+{
+    float height = worldPos.y;
+    float layerThickness = max(ubo.cloudTopHeight - ubo.cloudBaseHeight, 1.0);
+
+    // Outside cloud layer? No density.
+    if (height < ubo.cloudBaseHeight || height > ubo.cloudTopHeight)
+        return 0.0;
+
+    // Normalized height within cloud layer [0,1]
+    float hNorm = (height - ubo.cloudBaseHeight) / layerThickness;
+
+    // Height gradient based on cloud type
+    float heightGrad = cloudHeightGradient(hNorm, ubo.cloudType);
+    if (heightGrad < 0.001) return 0.0;
+
+    // Wind-displaced sample position
+    vec3 samplePos = worldPos + vec3(ubo.cloudWindOffset.x, 0.0, ubo.cloudWindOffset.y);
+
+    // Base shape: large-scale Perlin FBM
+    vec3 shapeCoord = samplePos * ubo.cloudNoiseScale;
+    float shape = fbmPerlin(shapeCoord, 5);
+
+    // Worley for cellular structure (inverted: 1 - worley for puffy look)
+    float worley = 1.0 - fbmWorley(shapeCoord * 1.5, 3);
+
+    // Combine: Perlin-Worley hybrid
+    float baseShape = clamp(mix(shape, worley, 0.35), 0.0, 1.0);
+
+    // Coverage remap: shape - (1 - coverage) pushes density by coverage
+    float coverageRemap = baseShape - (1.0 - ubo.cloudCoverage);
+    coverageRemap = max(coverageRemap, 0.0);
+    coverageRemap /= max(ubo.cloudCoverage, 0.01);
+
+    // For light marching, skip expensive detail erosion
+    if (cheapSample) {
+        return coverageRemap * heightGrad * ubo.cloudDensity * DENSITY_MULT;
+    }
+
+    // Detail erosion: high-frequency Worley FBM carves away cloud edges
+    vec3 detailCoord = samplePos * ubo.cloudNoiseScale * 6.0
+                     + vec3(ubo.time * 0.02);
+    float detail = fbmWorley(detailCoord, 3);
+
+    float eroded = coverageRemap - detail * ubo.cloudErosion * (1.0 - hNorm * 0.5);
+    eroded = max(eroded, 0.0);
+
+    return eroded * heightGrad * ubo.cloudDensity * DENSITY_MULT;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Light march (toward sun for shadow/in-scatter)
+// ══════════════════════════════════════════════════════════════════════
+
+/// March toward the sun accumulating optical depth for shadow estimation.
+/// Uses cheap (no detail erosion) density samples.
+float lightMarch(vec3 startPos)
+{
+    float stepLen = LIGHT_MARCH_LEN / float(LIGHT_STEPS);
+    vec3  stepDir = ubo.sunDirection * stepLen;
+    vec3  pos     = startPos;
+
+    float opticalDepth = 0.0;
+
+    for (int i = 0; i < LIGHT_STEPS; i++) {
+        pos += stepDir;
+        float d = sampleCloudDensity(pos, true);
+        opticalDepth += d * stepLen;
+    }
+
+    return opticalDepth;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Ray-sphere intersection for cloud layer bounds
+// ══════════════════════════════════════════════════════════════════════
+
+/// Intersect a ray with a horizontal plane at y = planeY.
+/// Returns distance along ray (negative if behind ray origin).
+float intersectPlane(vec3 ro, vec3 rd, float planeY)
+{
+    if (abs(rd.y) < 0.0001) return -1.0; // Parallel to plane
+    return (planeY - ro.y) / rd.y;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Main
+// ══════════════════════════════════════════════════════════════════════
+
+void main()
+{
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = ivec2(ubo.screenWidth, ubo.screenHeight);
+
+    if (pixelCoord.x >= outputSize.x || pixelCoord.y >= outputSize.y)
+        return;
+
+    // ── Early exit if no clouds ──────────────────────────────────
+    if (ubo.cloudCoverage < 0.01 || ubo.cloudDensity < 0.001) {
+        imageStore(cloudTexture, pixelCoord, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // ── Reconstruct view ray ─────────────────────────────────────
+    vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(outputSize);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y; // Vulkan Y-flip
+
+    vec4 nearClip = ubo.invViewProj * vec4(ndc, 0.0, 1.0);
+    vec4 farClip  = ubo.invViewProj * vec4(ndc, 1.0, 1.0);
+    vec3 rayOrigin = nearClip.xyz / nearClip.w;
+    vec3 rayEnd    = farClip.xyz / farClip.w;
+    vec3 rayDir    = normalize(rayEnd - rayOrigin);
+
+    // ── Scene depth for early termination ────────────────────────
+    vec2 depthUV = uv;
+    float rawDepth = texture(depthBuffer, depthUV).r;
+    float linearDepth = ubo.nearPlane * ubo.farPlane
+                      / (ubo.farPlane - rawDepth * (ubo.farPlane - ubo.nearPlane));
+    float maxDist = (rawDepth < 0.9999) ? linearDepth : 1e6;
+
+    // ── Intersect ray with cloud layer planes ────────────────────
+    float tBase = intersectPlane(ubo.cameraPos, rayDir, ubo.cloudBaseHeight);
+    float tTop  = intersectPlane(ubo.cameraPos, rayDir, ubo.cloudTopHeight);
+
+    // Determine entry/exit along the ray
+    float tEntry, tExit;
+    if (ubo.cameraPos.y < ubo.cloudBaseHeight) {
+        // Camera below cloud layer — enter at base, exit at top
+        tEntry = tBase;
+        tExit  = tTop;
+    } else if (ubo.cameraPos.y > ubo.cloudTopHeight) {
+        // Camera above cloud layer — enter at top, exit at base
+        tEntry = tTop;
+        tExit  = tBase;
+    } else {
+        // Camera inside cloud layer — start at 0, exit at nearest boundary
+        tEntry = 0.0;
+        tExit  = max(tBase, tTop);
+    }
+
+    // Clamp to valid range
+    tEntry = max(tEntry, 0.0);
+    tExit  = max(tExit, tEntry);
+    tExit  = min(tExit, maxDist);
+
+    // No cloud intersection for this ray?
+    if (tEntry >= tExit || tEntry < 0.0) {
+        imageStore(cloudTexture, pixelCoord, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // ── Ray march through cloud layer ────────────────────────────
+
+    float marchLength = tExit - tEntry;
+    float stepLen = marchLength / float(PRIMARY_STEPS);
+
+    // Temporal jitter: offset starting position by blue noise per frame
+    float jitter = hash11(float(pixelCoord.x * 1973 + pixelCoord.y * 9277)
+                        + ubo.frameIndex * 26699.0);
+    float tCurrent = tEntry + stepLen * jitter;
+
+    // View-sun angle for phase function
+    float cosTheta = dot(rayDir, ubo.sunDirection);
+    float phase = cloudPhase(cosTheta, ubo.mieAnisotropy);
+
+    // Sun visibility factor (above horizon?)
+    float sunAboveHorizon = smoothstep(-0.05, 0.15, ubo.sunDirection.y);
+
+    // Ambient sky light (stronger during day, dim at night)
+    float dayFactor = smoothstep(0.2, 0.35, ubo.dayProgress)
+                    * smoothstep(0.8, 0.65, ubo.dayProgress);
+    vec3 ambient = ubo.ambientColor * mix(AMBIENT_MIN, AMBIENT_MAX, dayFactor);
+
+    // Accumulation
+    vec3  accScattering  = vec3(0.0);
+    float accTransmittance = 1.0;
+
+    for (int i = 0; i < PRIMARY_STEPS; i++) {
+        if (accTransmittance < 0.003) break; // Early exit — ray fully occluded
+
+        vec3 samplePos = ubo.cameraPos + rayDir * tCurrent;
+        float density = sampleCloudDensity(samplePos, false);
+
+        if (density > 0.001) {
+            // ── Light contribution ───────────────────────────────
+
+            // March toward sun to find optical depth (shadow within cloud)
+            float lightOptDepth = lightMarch(samplePos);
+
+            // Beer-Lambert transmittance toward sun
+            float lightTransmittance = exp(-lightOptDepth * ABSORPTION_COEFF);
+
+            // Powder effect (multi-scatter approximation):
+            // Thin cloud edges scatter light efficiently, deep interiors are dark.
+            // Based on "A Scalable and Production Ready Sky and Atmosphere Rendering Technique"
+            float powder = 1.0 - exp(-density * stepLen * POWDER_STRENGTH * 2.0);
+
+            // Combined light energy
+            float lightEnergy = lightTransmittance * mix(1.0, powder, 0.5)
+                              * phase * sunAboveHorizon;
+
+            // Direct sun scattering
+            vec3 sunScatter = ubo.sunColor * ubo.sunIntensity * lightEnergy;
+
+            // Ambient contribution (multi-scatter approximation — deep cloud interiors
+            // receive scattered light from all directions, not just the sun)
+            float ambientOcclusion = 1.0 - smoothstep(0.0, 0.6, density * stepLen * 4.0);
+
+            // Normalized height for ambient gradient (top of clouds brighter)
+            float hNorm = clamp((samplePos.y - ubo.cloudBaseHeight)
+                              / max(ubo.cloudTopHeight - ubo.cloudBaseHeight, 1.0), 0.0, 1.0);
+            float heightAmbient = mix(0.6, 1.0, hNorm);
+
+            vec3 ambientScatter = ambient * ambientOcclusion * heightAmbient;
+
+            // Total in-scattered light at this sample
+            vec3 sampleScattering = (sunScatter + ambientScatter) * density;
+
+            // ── Extinction (Beer-Lambert) ────────────────────────
+            float sampleExtinction = density * ABSORPTION_COEFF * stepLen;
+            float sampleTransmittance = exp(-sampleExtinction);
+
+            // Energy-conserving integration (Frostbite method):
+            // S_int = (S / extinction) * (1 - transmittance)
+            // This avoids order-dependent scattering artifacts.
+            vec3 integScattering = sampleScattering * (1.0 - sampleTransmittance)
+                                 / max(density * ABSORPTION_COEFF, 0.0001);
+
+            accScattering += accTransmittance * integScattering;
+            accTransmittance *= sampleTransmittance;
+        }
+
+        tCurrent += stepLen;
+    }
+
+    // ── Store result ─────────────────────────────────────────────
+    // RGB = in-scattered cloud light, A = transmittance (1.0 = clear, 0.0 = opaque cloud)
+    imageStore(cloudTexture, pixelCoord, vec4(accScattering, accTransmittance));
+}

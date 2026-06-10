@@ -1,0 +1,122 @@
+/// @file volumetric_integrate.comp
+/// @brief Front-to-back integration of the froxel volume into a 2D scattering map.
+///
+/// After volumetric_atmosphere.comp fills the 3D froxel volume with per-voxel
+/// scattering and extinction, this shader integrates (ray-marches) each screen
+/// pixel from the near plane to its depth, accumulating transmittance and
+/// in-scattered light.
+///
+/// The output LUT is applied during the lighting/composite pass via
+/// simple texture lookup.
+///
+/// Dispatch: (FROXEL_W/8, FROXEL_H/8, 1) = (20, 12, 1) workgroups.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ── Froxel volume dimensions ─────────────────────────────────────────
+#define FROXEL_W 160
+#define FROXEL_H 90
+#define FROXEL_D 64
+
+// ── Input: 3D froxel volume (scattering RGB, extinction A) ──────────
+layout(set = 0, binding = 0) uniform sampler3D froxelVolume;
+
+// ── Input: depth buffer (for scene depth cutoff) ─────────────────────
+layout(set = 0, binding = 1) uniform sampler2D depthBuffer;
+
+// ── Output: 2D scattering LUT (accumulated scattering RGB, transmittance A) ─
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D scatteringLUT;
+
+// ── Camera parameters ────────────────────────────────────────────────
+layout(push_constant) uniform IntegrationParams {
+    float nearPlane;
+    float farPlane;
+    float screenWidth;
+    float screenHeight;
+} params;
+
+// ══════════════════════════════════════════════════════════════════════
+// Helpers
+// ══════════════════════════════════════════════════════════════════════
+
+/// Convert linear depth to froxel slice index (exponential distribution).
+float depthToSlice(float linearDepth)
+{
+    if (linearDepth <= params.nearPlane) return 0.0;
+    return float(FROXEL_D) * log(linearDepth / params.nearPlane)
+           / log(params.farPlane / params.nearPlane);
+}
+
+/// Slice thickness in linear depth for a given slice.
+float sliceThickness(int slice)
+{
+    float t0 = float(slice) / float(FROXEL_D);
+    float t1 = float(slice + 1) / float(FROXEL_D);
+    float d0 = params.nearPlane * pow(params.farPlane / params.nearPlane, t0);
+    float d1 = params.nearPlane * pow(params.farPlane / params.nearPlane, t1);
+    return d1 - d0;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Main: front-to-back integration
+// ══════════════════════════════════════════════════════════════════════
+
+void main()
+{
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoord.x >= FROXEL_W || pixelCoord.y >= FROXEL_H)
+        return;
+
+    // Sample scene depth at this pixel to know where to stop marching.
+    vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(FROXEL_W, FROXEL_H);
+    float rawDepth = texture(depthBuffer, uv).r;
+
+    // Convert hardware depth [0,1] to linear depth
+    float linearDepth = params.nearPlane * params.farPlane
+                      / (params.farPlane - rawDepth * (params.farPlane - params.nearPlane));
+
+    // Maximum froxel slice for this pixel
+    float maxSlice = depthToSlice(linearDepth);
+    int maxSliceInt = min(int(ceil(maxSlice)), FROXEL_D);
+
+    // Front-to-back accumulation
+    vec3  accumulatedScattering = vec3(0.0);
+    float transmittance = 1.0;
+
+    for (int slice = 0; slice < maxSliceInt; slice++) {
+        // Sample the froxel at this XY + slice
+        vec3 texCoord = vec3(uv, (float(slice) + 0.5) / float(FROXEL_D));
+        vec4 froxel = texture(froxelVolume, texCoord);
+
+        vec3  sliceScattering = froxel.rgb;
+        float sliceExtinction = froxel.a;
+
+        // Slice thickness for integration step
+        float thickness = sliceThickness(slice);
+
+        // Beer-Lambert transmittance for this slice
+        float sliceTransmittance = exp(-sliceExtinction * thickness);
+
+        // Energy-conserving integration:
+        // scattering_contribution = scattering * (1 - e^(-extinction*thickness)) / extinction
+        float integralFactor = (sliceExtinction > 0.0001)
+            ? (1.0 - sliceTransmittance) / sliceExtinction
+            : thickness;
+
+        accumulatedScattering += transmittance * sliceScattering * integralFactor;
+        transmittance *= sliceTransmittance;
+
+        // Early out when transmittance is negligible
+        if (transmittance < 0.003) {
+            transmittance = 0.0;
+            break;
+        }
+    }
+
+    // Write result: RGB = accumulated scattering, A = remaining transmittance
+    imageStore(scatteringLUT, pixelCoord,
+               vec4(accumulatedScattering, transmittance));
+}

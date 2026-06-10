@@ -1,0 +1,16 @@
+{
+  "name": "hybrid-render-pipeline",
+  "version-string": "1.2.0",
+  "description": "Hybrid Forward+Compute Render Pipeline — reference implementation in C++20 / Vulkan 1.3",
+  "homepage": "https://github.com/Stelliro/hybrid-render-pipeline",
+  "license": "CC-BY-SA-4.0",
+  "dependencies": [
+    "vulkan",
+    "vulkan-headers",
+    "vulkan-memory-allocator",
+    "glm",
+    "sdl3",
+    "spdlog",
+    "stb"
+  ]
+}

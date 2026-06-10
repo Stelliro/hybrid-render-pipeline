@@ -1,0 +1,29 @@
+# ── Build output ──────────────────────────────────────────────────────
+build/
+build-*/
+out/
+cmake-build-*/
+
+# ── Compiled shaders ──────────────────────────────────────────────────
+*.spv
+
+# ── Runtime artifacts ─────────────────────────────────────────────────
+render_pipeline.log
+*.pdb
+
+# ── vcpkg ─────────────────────────────────────────────────────────────
+vcpkg_installed/
+.vcpkg-root
+
+# ── IDE ───────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+CMakeUserPresets.json
+
+# ── OS junk ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

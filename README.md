@@ -3,9 +3,28 @@
 > A novel rendering architecture combining forward geometry passes with compute-based screen-space lighting, designed for cinematic open-world games running on mid-range GPUs.
 
 **Author:** [Stelliro](https://github.com/Stelliro)  
-**Engine:** Custom C++20 / Vulkan 1.3  
-**Status:** Prototype — proven in production on *Stelliferrum Forge* engine  
+**Language:** C++20 / Vulkan 1.3  
+**Status:** Prototype — battle-tested in production  
 **License:** CC BY-SA 4.0 (see [LICENSE](LICENSE))
+
+---
+
+## Reference Implementation
+
+The `src/` and `shaders/` directories contain a minimal working implementation of the pipeline described below. It boots a window, runs the full screen-space stack (Hi-Z → GTAO+ → SVRM GI → SHR reflections → ACTF denoise → composite) against a procedural FBM-heightmap terrain and an inverted sky-dome mesh.
+
+The implementation is intentionally bare — no shadow pass (a 1×1 always-lit dummy is bound), no skybox shader (vertex-coloured dome stands in), no scene graph, no input layer beyond mouse drag/scroll. It exists so you can `cmake --build` and see something on screen on day one. Everything else is yours to wire.
+
+**Build (vcpkg manifest mode):**
+```bash
+git clone https://github.com/Stelliro/hybrid-render-pipeline.git
+cd hybrid-render-pipeline
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+./build/Release/hrp_demo
+```
+
+Requires the Vulkan SDK (for `glslc`) and a GPU supporting Vulkan 1.3 with dynamic rendering.
 
 ---
 
@@ -698,7 +717,6 @@ If you use this rendering architecture or any of the novel techniques (SVRM, GTA
 ```
 Hybrid Forward+Compute Render Pipeline
 Author: Stelliro (https://github.com/Stelliro)
-Origin: Stelliferrum Forge Engine
 Year: 2025–2026
 License: CC BY-SA 4.0
 ```

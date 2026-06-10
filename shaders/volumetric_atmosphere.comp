@@ -1,0 +1,484 @@
+/// @file volumetric_atmosphere.comp
+/// @brief Compute shader — froxel-based volumetric fog, clouds, god rays.
+///
+/// Ray-marches through a 160×90×64 froxel volume, sampling:
+///   - Height-exponential fog driven by weather
+///   - Procedural cloud layer (FBM noise)
+///   - Local smoke sources (campfires, chimneys)
+///   - Rayleigh + Mie in-scattering from the sun
+///   - God rays via shadow map occlusion
+///
+/// Reads: VolumetricUBO (set 0, binding 0), depth buffer (set 0, binding 1),
+///         shadow cascade (set 0, binding 2), local sources SSBO (set 0, binding 3).
+/// Writes: 3D froxel volume texture (set 0, binding 4) — RGBA16F.
+///
+/// Dispatch: (160/8, 90/8, 64/1) = (20, 12, 64) workgroups, 8×8×1 threads each.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ── Froxel volume dimensions ─────────────────────────────────────────
+#define FROXEL_W 160
+#define FROXEL_H 90
+#define FROXEL_D 64
+
+// ── Max local volumetric sources (must match CPU-side MAX) ───────────
+#define MAX_LOCAL_SOURCES 64
+
+// ── UBO: atmospheric parameters from VolumetricAtmosphereSystem ──────
+layout(set = 0, binding = 0) uniform VolumetricUBO {
+    // Camera
+    mat4  invViewProj;
+    vec3  cameraPos;
+    float nearPlane;
+    float farPlane;
+    float _pad0[3];
+
+    // Sun
+    vec3  sunDirection;
+    float sunIntensity;
+    vec3  sunColor;
+    float _pad1;
+
+    // Fog
+    float fogDensity;
+    float fogHeightFalloff;
+    float fogMaxHeight;
+    float fogScattering;
+    vec3  fogColor;
+    float fogAbsorption;
+
+    // Clouds
+    float cloudCoverage;
+    float cloudDensity;
+    float cloudBaseHeight;
+    float cloudTopHeight;
+    vec2  cloudWindOffset;
+    float cloudNoiseScale;
+    float cloudErosion;
+
+    // Precipitation
+    float precipitation;
+    float precipType;
+    float _pad2[2];
+
+    // Atmospheric scattering
+    vec3  ambientColor;
+    float rayleighCoeff;
+    float mieCoeff;
+    float mieAnisotropy;
+    float _pad3[2];
+
+    // God rays
+    float godRayIntensity;
+    float godRayDecay;
+    float godRayDensity;
+    float _pad4;
+
+    // Time
+    float time;
+    float dayProgress;
+    float _pad5[2];
+
+    // Wind
+    vec2  windDirection;
+    float windStrength;
+    float _pad6;
+
+    // Local sources
+    int   localSourceCount;
+    float _pad7[3];
+} ubo;
+
+// ── Depth buffer ─────────────────────────────────────────────────────
+layout(set = 0, binding = 1) uniform sampler2D depthBuffer;
+
+// ── Shadow cascade map ───────────────────────────────────────────────
+layout(set = 0, binding = 2) uniform sampler2DArray shadowCascades;
+
+// ── Local volumetric sources SSBO ────────────────────────────────────
+struct LocalSource {
+    vec3  position;
+    float radius;
+    float density;
+    float riseSpeed;
+    float temperature;
+    float _pad;
+    vec3  color;
+    float lifetime;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer LocalSourcesSSBO {
+    LocalSource sources[MAX_LOCAL_SOURCES];
+} localSources;
+
+// ── Output: 3D froxel volume (scattering RGB + extinction A) ────────
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D froxelVolume;
+
+// ══════════════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════════════
+
+const float PI = 3.14159265358979;
+const float INV_4PI = 1.0 / (4.0 * PI);
+
+// Noise constants for procedural clouds
+const int NOISE_OCTAVES = 4;
+
+// ══════════════════════════════════════════════════════════════════════
+// Utility functions
+// ══════════════════════════════════════════════════════════════════════
+
+/// Hash function for procedural noise.
+float hash31(vec3 p)
+{
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+/// Value noise 3D.
+float valueNoise3D(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f); // Hermite smoothstep
+
+    float n000 = hash31(i + vec3(0,0,0));
+    float n100 = hash31(i + vec3(1,0,0));
+    float n010 = hash31(i + vec3(0,1,0));
+    float n110 = hash31(i + vec3(1,1,0));
+    float n001 = hash31(i + vec3(0,0,1));
+    float n101 = hash31(i + vec3(1,0,1));
+    float n011 = hash31(i + vec3(0,1,1));
+    float n111 = hash31(i + vec3(1,1,1));
+
+    float nx00 = mix(n000, n100, f.x);
+    float nx10 = mix(n010, n110, f.x);
+    float nx01 = mix(n001, n101, f.x);
+    float nx11 = mix(n011, n111, f.x);
+
+    float nxy0 = mix(nx00, nx10, f.y);
+    float nxy1 = mix(nx01, nx11, f.y);
+
+    return mix(nxy0, nxy1, f.z);
+}
+
+/// Fractal Brownian Motion (FBM) for cloud shapes.
+float fbm(vec3 p, int octaves)
+{
+    float value = 0.0;
+    float amplitude = 0.5;
+    float frequency = 1.0;
+
+    for (int i = 0; i < octaves; i++) {
+        value += amplitude * valueNoise3D(p * frequency);
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    return value;
+}
+
+/// Reconstruct world position from UV + froxel depth slice.
+vec3 froxelToWorldPos(ivec3 froxelCoord)
+{
+    // UV in [0,1]
+    vec2 uv = (vec2(froxelCoord.xy) + 0.5) / vec2(FROXEL_W, FROXEL_H);
+
+    // Exponential depth distribution (more slices near camera)
+    float sliceT = (float(froxelCoord.z) + 0.5) / float(FROXEL_D);
+    float depth = ubo.nearPlane * pow(ubo.farPlane / ubo.nearPlane, sliceT);
+
+    // NDC → clip → world
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 clipPos = vec4(ndc.x, -ndc.y, depth / ubo.farPlane, 1.0);
+    vec4 worldPos = ubo.invViewProj * clipPos;
+    return worldPos.xyz / worldPos.w;
+}
+
+/// Linear depth from froxel slice index.
+float froxelSliceDepth(int slice)
+{
+    float t = (float(slice) + 0.5) / float(FROXEL_D);
+    return ubo.nearPlane * pow(ubo.farPlane / ubo.nearPlane, t);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Phase functions
+// ══════════════════════════════════════════════════════════════════════
+
+/// Rayleigh phase function.
+float phaseRayleigh(float cosTheta)
+{
+    return (3.0 / (16.0 * PI)) * (1.0 + cosTheta * cosTheta);
+}
+
+/// Henyey-Greenstein phase function (Mie scattering).
+float phaseHG(float cosTheta, float g)
+{
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return INV_4PI * (1.0 - g2) / (denom * sqrt(denom));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Density sampling functions
+// ══════════════════════════════════════════════════════════════════════
+
+/// Sample height-exponential fog density at a world position.
+float sampleFogDensity(vec3 worldPos)
+{
+    if (ubo.fogDensity <= 0.0) return 0.0;
+    if (worldPos.y > ubo.fogMaxHeight) return 0.0;
+
+    // Exponential height falloff
+    float heightFactor = exp(-ubo.fogHeightFalloff * max(worldPos.y, 0.0));
+
+    // Wind-driven noise for volume detail
+    vec3 noisePos = worldPos * 0.01 + vec3(ubo.windDirection.x, 0, ubo.windDirection.y)
+                     * ubo.time * ubo.windStrength * 0.5;
+    float noise = fbm(noisePos, 2);
+    noise = mix(0.7, 1.3, noise); // Bias toward 1.0
+
+    return ubo.fogDensity * heightFactor * noise;
+}
+
+/// Sample cloud density at a world position.
+float sampleCloudDensity(vec3 worldPos)
+{
+    if (ubo.cloudCoverage <= 0.0) return 0.0;
+
+    float height = worldPos.y;
+    if (height < ubo.cloudBaseHeight || height > ubo.cloudTopHeight)
+        return 0.0;
+
+    // Normalized height within cloud layer [0,1]
+    float cloudHeight = (height - ubo.cloudBaseHeight) /
+                         max(ubo.cloudTopHeight - ubo.cloudBaseHeight, 1.0);
+
+    // Cloud base shape: denser in lower-middle, thinner at top/bottom
+    float heightGradient = smoothstep(0.0, 0.15, cloudHeight)
+                         * smoothstep(1.0, 0.7, cloudHeight);
+
+    // Large-scale cloud shape noise
+    vec3 cloudPos = worldPos * ubo.cloudNoiseScale
+                  + vec3(ubo.cloudWindOffset.x, 0, ubo.cloudWindOffset.y);
+    float shape = fbm(cloudPos, NOISE_OCTAVES);
+
+    // Coverage remap: shape - (1 - coverage) to control how much sky is filled
+    float coverageRemap = shape - (1.0 - ubo.cloudCoverage);
+    coverageRemap = max(coverageRemap, 0.0);
+    coverageRemap *= 1.0 / max(ubo.cloudCoverage, 0.01); // Normalize
+
+    // Detail erosion
+    vec3 detailPos = worldPos * ubo.cloudNoiseScale * 5.0
+                   + vec3(ubo.cloudWindOffset.x * 2.0, ubo.time * 0.1, ubo.cloudWindOffset.y * 2.0);
+    float detail = fbm(detailPos, 2);
+    float eroded = coverageRemap - detail * ubo.cloudErosion;
+    eroded = max(eroded, 0.0);
+
+    return eroded * ubo.cloudDensity * heightGradient;
+}
+
+/// Sample local smoke/steam sources at a world position.
+/// Returns (density, color).
+void sampleLocalSources(vec3 worldPos, out float totalDensity, out vec3 totalColor)
+{
+    totalDensity = 0.0;
+    totalColor = vec3(0.0);
+
+    int count = min(ubo.localSourceCount, MAX_LOCAL_SOURCES);
+    for (int i = 0; i < count; i++) {
+        vec3  sPos   = localSources.sources[i].position;
+        float sRad   = localSources.sources[i].radius;
+        float sDens  = localSources.sources[i].density;
+        vec3  sColor = localSources.sources[i].color;
+
+        float dist = length(worldPos - sPos);
+        if (dist > sRad) continue;
+
+        // Smooth spherical falloff
+        float falloff = 1.0 - smoothstep(0.0, sRad, dist);
+        falloff *= falloff; // Quadratic falloff for more natural look
+
+        // Turbulence noise
+        vec3 noiseP = (worldPos - sPos) * 0.3 + vec3(0, ubo.time * 0.5, 0);
+        float turb = fbm(noiseP, 2);
+        falloff *= mix(0.5, 1.0, turb);
+
+        float contribution = sDens * falloff;
+        totalColor += sColor * contribution;
+        totalDensity += contribution;
+    }
+
+    // Normalize color by density
+    if (totalDensity > 0.001) {
+        totalColor /= totalDensity;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// In-scattering computation
+// ══════════════════════════════════════════════════════════════════════
+
+/// Compute in-scattered light at a sample point.
+vec3 computeInScattering(vec3 worldPos, float density, float cosTheta)
+{
+    // Rayleigh contribution (sky color scattering)
+    float pR = phaseRayleigh(cosTheta);
+    vec3 rayleigh = ubo.ambientColor * ubo.rayleighCoeff * pR;
+
+    // Mie contribution (forward scattering from particles/clouds)
+    float pM = phaseHG(cosTheta, ubo.mieAnisotropy);
+    vec3 mie = ubo.sunColor * ubo.sunIntensity * ubo.mieCoeff * pM;
+
+    // Combined scattering
+    vec3 scattering = rayleigh + mie;
+
+    // Fog self-color contribution (ambient in-scattering)
+    vec3 fogAmbient = ubo.fogColor * ubo.ambientColor * density * 0.3;
+
+    return scattering * density + fogAmbient;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// God ray sampling
+// ══════════════════════════════════════════════════════════════════════
+
+/// Compute god ray contribution (light shaft visibility toward sun).
+float sampleGodRay(vec3 worldPos)
+{
+    if (ubo.godRayIntensity <= 0.0) return 0.0;
+
+    // March toward sun and check occlusion (simplified: use cloud density)
+    const int GOD_RAY_STEPS = 8;
+    float stepSize = 50.0; // meters
+    vec3 marchDir = ubo.sunDirection;
+
+    float transmittance = 1.0;
+    vec3 marchPos = worldPos;
+
+    for (int i = 0; i < GOD_RAY_STEPS; i++) {
+        marchPos += marchDir * stepSize;
+        float cloud = sampleCloudDensity(marchPos);
+        float fog   = sampleFogDensity(marchPos);
+        transmittance *= exp(-(cloud + fog) * stepSize * ubo.godRayDensity);
+
+        if (transmittance < 0.01) break; // Early exit
+    }
+
+    return transmittance * ubo.godRayIntensity;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Precipitation overlay
+// ══════════════════════════════════════════════════════════════════════
+
+/// Add precipitation particles as a scattering contribution.
+vec3 samplePrecipitation(vec3 worldPos)
+{
+    if (ubo.precipitation <= 0.0) return vec3(0.0);
+
+    // Simple streaked noise for rain, soft noise for snow
+    vec3 precipPos = worldPos * 0.05;
+    precipPos.y += ubo.time * mix(15.0, 2.0, ubo.precipType); // Rain falls fast, snow slow
+
+    float noise = valueNoise3D(precipPos);
+
+    // Rain: directional streaks using wind
+    if (ubo.precipType < 0.5) {
+        precipPos.xz += ubo.windDirection * ubo.windStrength * 3.0;
+        noise = pow(noise, 3.0); // Sharper streaks
+    }
+
+    float intensity = noise * ubo.precipitation * 0.15;
+    vec3 precipColor = mix(vec3(0.7, 0.72, 0.75), // Rain: grey-white
+                            vec3(0.95, 0.97, 1.0),  // Snow: bright white
+                            ubo.precipType);
+    return precipColor * intensity;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Main
+// ══════════════════════════════════════════════════════════════════════
+
+void main()
+{
+    ivec3 froxelCoord = ivec3(gl_GlobalInvocationID.xyz);
+
+    // Bounds check
+    if (froxelCoord.x >= FROXEL_W ||
+        froxelCoord.y >= FROXEL_H ||
+        froxelCoord.z >= FROXEL_D) {
+        return;
+    }
+
+    // Reconstruct world position for this froxel
+    vec3 worldPos = froxelToWorldPos(froxelCoord);
+    float sliceDepth = froxelSliceDepth(froxelCoord.z);
+
+    // View direction (camera → froxel)
+    vec3 viewDir = normalize(worldPos - ubo.cameraPos);
+    float cosTheta = dot(viewDir, ubo.sunDirection);
+
+    // ── Sample all density sources ───────────────────────────────
+
+    // Height-exponential fog
+    float fogDens = sampleFogDensity(worldPos);
+
+    // Cloud layer
+    float cloudDens = sampleCloudDensity(worldPos);
+
+    // Local smoke/steam sources
+    float localDens;
+    vec3  localColor;
+    sampleLocalSources(worldPos, localDens, localColor);
+
+    // ── Combine densities ────────────────────────────────────────
+
+    float totalDensity = fogDens + cloudDens + localDens;
+
+    // Early-out for empty froxels (perf optimization)
+    if (totalDensity < 0.0001) {
+        imageStore(froxelVolume, froxelCoord, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // ── Compute scattering and extinction ────────────────────────
+
+    // In-scattered light
+    vec3 inScattered = computeInScattering(worldPos, totalDensity, cosTheta);
+
+    // God rays (light shafts through clouds)
+    float godRay = sampleGodRay(worldPos);
+    vec3 godRayColor = ubo.sunColor * godRay * max(cosTheta, 0.0);
+
+    // Precipitation contribution
+    vec3 precipScatter = samplePrecipitation(worldPos);
+
+    // Local source coloring
+    vec3 localScatter = localColor * localDens * ubo.ambientColor;
+
+    // ── Combine all scattering ───────────────────────────────────
+
+    // Weighted blend of fog color, cloud white, smoke color
+    float fogWeight   = fogDens / totalDensity;
+    float cloudWeight = cloudDens / totalDensity;
+    float localWeight = localDens / totalDensity;
+
+    vec3 mediaAlbedo = ubo.fogColor * fogWeight
+                     + vec3(0.95, 0.97, 1.0) * cloudWeight // Clouds are bright white
+                     + localColor * localWeight;
+
+    // Total scattering = in-scattering + god rays + precipitation
+    vec3 totalScattering = inScattered + godRayColor + precipScatter + localScatter;
+
+    // Extinction coefficient
+    float extinction = totalDensity * (ubo.fogScattering + ubo.fogAbsorption);
+
+    // ── Write to froxel volume ───────────────────────────────────
+    // RGB = accumulated scattering, A = extinction (for transmittance integration)
+    imageStore(froxelVolume, froxelCoord,
+               vec4(totalScattering * mediaAlbedo, extinction));
+}

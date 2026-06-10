@@ -1,6 +1,15 @@
 # Changelog
 
-All notable changes to this documentation will be documented in this file.
+All notable changes to this repository will be documented in this file.
+
+## [1.2.0] - 2026-06-10
+
+### Added
+- Reference implementation in `src/` and `shaders/` (C++20 / Vulkan 1.3)
+  - `Renderer`, `ScreenSpaceEffects`, `Camera`, `Input`, `Log`, `Platform`, `Types`, `Frustum`, `ErrorCodes`
+  - 25 GLSL shaders covering the full forward+compute pipeline
+  - `main.cpp` demo: procedural FBM terrain + sky dome + orbit camera, driving the full screen-space stack
+  - `CMakeLists.txt` with vcpkg manifest mode; auto-compiles shaders to `build/shaders/*.spv`
 
 ## [1.1.0] - 2026-04-15
 
