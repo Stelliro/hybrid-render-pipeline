@@ -111,10 +111,6 @@ public:
     [[nodiscard]] VmaAllocator     GetAllocator()       const { return m_allocator; }
     [[nodiscard]] VkCommandPool    GetCommandPool()     const { return m_commandPool; }
 
-    /// Descriptor set layout used by the 3D pipeline's shadow map binding (set 0, depth-compare sampler).
-    /// External code that wants to call Bind3DShadowSet() must allocate the descriptor set with this layout.
-    [[nodiscard]] VkDescriptorSetLayout Get3DShadowSetLayout() const { return m_3dShadowSetLayout; }
-
     // ── Mesh management ──────────────────────────────────────────────
 
     /// Creates a GPU vertex buffer from CPU vertex data.

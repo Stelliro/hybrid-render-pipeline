@@ -638,9 +638,9 @@ bool Renderer::CreateInstance(Platform& platform)
 {
     VkApplicationInfo appInfo{};
     appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName   = "Hybrid Render Pipeline";
+    appInfo.pApplicationName   = "Where Giants Rust";
     appInfo.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-    appInfo.pEngineName        = "Hybrid Render Pipeline";
+    appInfo.pEngineName        = "Stelliferrum Forge";
     appInfo.engineVersion      = VK_MAKE_API_VERSION(0, 0, 1, 0);
     appInfo.apiVersion         = VK_API_VERSION_1_3;
 
@@ -1414,8 +1414,9 @@ bool Renderer::Create3DPipeline()
     rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth   = 1.0f;
-    // Draw both sides — the basic mesh shader is flat vertex-colour only and
-    // we don't assume a consistent winding convention from caller-authored meshes.
+    // GEOM and settlement prefabs still contain a mix of historical winding
+    // conventions. The basic mesh shader is flat vertex-colour only, so draw
+    // both sides until the content pipeline has a single authored convention.
     rasterizer.cullMode    = VK_CULL_MODE_NONE;
     rasterizer.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 

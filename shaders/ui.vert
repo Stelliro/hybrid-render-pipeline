@@ -1,7 +1,7 @@
 #version 450
 
 // ═══════════════════════════════════════════════════════════════════════
-//  ui.vert — 2D UI vertex shader for Hybrid Render Pipeline custom UI
+//  ui.vert — 2D UI vertex shader for Stelliferrum Forge custom UI
 //
 //  Transforms screen-space pixel coordinates to Vulkan NDC.
 //  Vertex format: pos(vec2) + uv(vec2) + color(packed u32 ABGR).

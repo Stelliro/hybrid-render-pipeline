@@ -1,7 +1,7 @@
 #version 450
 
 // ═══════════════════════════════════════════════════════════════════════
-//  ui.frag — 2D UI fragment shader for Hybrid Render Pipeline custom UI
+//  ui.frag — 2D UI fragment shader for Stelliferrum Forge custom UI
 //
 //  Samples a font atlas texture (alpha channel) and modulates by vertex
 //  color.  For solid-color geometry, the atlas contains a white pixel

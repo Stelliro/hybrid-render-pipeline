@@ -381,7 +381,12 @@ float starLayer(vec3 dir, float scale, float threshold, float seed)
 
             float starHash = hash21(neighbor * 127.1 + seed);
             if (starHash > threshold) {
-                float starSize = 0.012 + 0.028 * hash21(neighbor * 31.7 + seed);
+                // Star angular size. Generous so the bright layers (low scale =
+                // big cells) read as clearly visible points rather than the
+                // sub-pixel specks that were effectively invisible before. The
+                // faint/dust layers use high `scale` (tiny cells), so the same
+                // value still yields small stars there — the look stays layered.
+                float starSize = 0.045 + 0.090 * hash21(neighbor * 31.7 + seed);
                 float star = 1.0 - smoothstep(0.0, starSize, dist);
                 star *= star;
 
@@ -445,28 +450,28 @@ vec3 renderStars(vec3 dir, float starVis, float deepNightVis)
 
     // Layer 1: Giant / navigation stars (very sparse, VERY bright)
     // These are the key stars players learn to navigate by — visible from dusk
-    float giants = starLayer(rotDir, 50.0, 0.96, seed);
-    stars += giants * starColor(rotDir, seed) * 8.0;
+    float giants = starLayer(rotDir, 50.0, 0.94, seed);
+    stars += giants * starColor(rotDir, seed) * 14.0;
 
     // Layer 2: Bright primary stars
-    float bright = starLayer(rotDir, 90.0, 0.93, seed + 13.0);
-    stars += bright * starColor(rotDir, seed + 13.0) * 4.0;
+    float bright = starLayer(rotDir, 90.0, 0.91, seed + 13.0);
+    stars += bright * starColor(rotDir, seed + 13.0) * 7.0;
 
     // Layer 3: Medium stars
-    float medium = starLayer(rotDir, 220.0, 0.89, seed + 37.0);
-    stars += medium * starColor(rotDir, seed + 37.0) * 2.0;
+    float medium = starLayer(rotDir, 220.0, 0.87, seed + 37.0);
+    stars += medium * starColor(rotDir, seed + 37.0) * 3.5;
 
     // Layer 4: Faint stars (appear later in twilight)
-    float faint = starLayer(rotDir, 500.0, 0.83, seed + 61.0);
-    stars += faint * starColor(rotDir, seed + 61.0) * 0.8 * deepNightVis;
+    float faint = starLayer(rotDir, 500.0, 0.82, seed + 61.0);
+    stars += faint * starColor(rotDir, seed + 61.0) * 1.4 * deepNightVis;
 
     // Layer 5: Very faint star dust
     float dust1 = starLayer(rotDir, 1000.0, 0.79, seed + 89.0);
-    stars += dust1 * vec3(0.80, 0.85, 1.0) * 0.28 * deepNightVis;
+    stars += dust1 * vec3(0.80, 0.85, 1.0) * 0.45 * deepNightVis;
 
     // Layer 6: Ultra-faint background (visual texture)
     float dust2 = starLayer(rotDir, 1800.0, 0.76, seed + 127.0);
-    stars += dust2 * vec3(0.75, 0.80, 0.95) * 0.14 * deepNightVis;
+    stars += dust2 * vec3(0.75, 0.80, 0.95) * 0.24 * deepNightVis;
 
     // First 3 layers use starVis, last 3 use deepNightVis (applied above)
     return stars * starVis * sInt;
@@ -737,17 +742,25 @@ vec3 renderPlanetaryRing(vec3 dir, float nightVisibility)
     ringColor *= planetShadow;
 
     // ── Sun/night lit factor ─────────────────────────────────────────
+    // The ring is sunlit, so its brightness should track how much the sun
+    // actually faces it. Deep at night the sun is far below the horizon and the
+    // visible ring is mostly in the planet's shadow / only faint earthshine, so
+    // fade it well down instead of leaving it glaring against the dark sky.
     float sunLit    = dot(ringNormal, pc.sunDir.xyz);
-    float litFactor = 0.25 + 0.75 * max(sunLit, 0.0);
+    float litFactor = 0.18 + 0.82 * max(sunLit, 0.0);
+    // Sun-elevation falloff: full by day, ~0.22 at deep night.
+    float ringSunIllum = clamp(0.22 + 0.78 * smoothstep(-0.35, 0.05, pc.sunDir.y), 0.0, 1.0);
+    litFactor *= ringSunIllum;
 
     // Stars faintly visible through thin ring parts (C ring)
     float transparency = bandC * 0.25;
 
-    // Day dimming (atmosphere overpowers ring during day)
-    float dayDim     = mix(1.0, 0.12, smoothstep(-0.05, 0.20, pc.sunDir.y));
+    // Day dimming (atmosphere overpowers ring during day). Kept very low so the
+    // ring is a subtle night/twilight feature rather than bands across the day sky.
+    float dayDim     = mix(1.0, 0.03, smoothstep(-0.05, 0.20, pc.sunDir.y));
     float visibility = mix(dayDim, 1.0, nightVisibility);
 
-    return ringColor * ringPattern * ringBandIntensity * litFactor * visibility * 0.75;
+    return ringColor * ringPattern * ringBandIntensity * litFactor * visibility * 0.55;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1677,7 +1690,9 @@ vec3 renderLightPillars(vec3 dir, vec3 sunDir, float sunElev)
 
     vec3 pillarColor = computeSunColor(pc.skyParams.x) * vec3(1.0, 0.92, 0.85);
 
-    return pillarColor * pillarWidth * pillarHeight * structure * visStrength * 0.25;
+    // Toned down: a soft glow above the sun, not a bright column that reads as a
+    // separate object (it was being mistaken for the galaxy at dusk).
+    return pillarColor * pillarWidth * pillarHeight * structure * visStrength * 0.10;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1897,14 +1912,23 @@ vec3 renderWeatherClouds(vec3 viewDir, vec3 sunDir, float dayProgress,
     float driftSpeed = 8.0 + windStrength * 40.0;
     vec2 drift = windDir * time * driftSpeed;
 
-    // Sample coordinates on the dome
-    vec2 uv = hitPos.xz * 0.0004 + drift * 0.0004;
+    // Sample coordinates on the dome. hitPos.xz is in normalized dome units
+    // (~±1 across the visible sky), so the spatial scale must be ~O(1) to get
+    // a handful of distinct clouds — the old 0.0004 sampled the noise at a
+    // near-constant point, giving a flat featureless overcast. Wind drift is
+    // kept slow and separate so clouds advect across the sky over ~tens of sec.
+    vec2 uv = hitPos.xz * 0.7 + drift * 0.0004;
 
     // ── Shape noise — varies by cloud type ──────────────────────────
 
     float shape = 0.0;
     float detail = 0.0;
-    float verticalFade = smoothstep(0.0, 0.15, viewDir.y) * smoothstep(0.85, 0.4, viewDir.y);
+    // Fade clouds in just above the horizon (avoids a hard seam at the skyline)
+    // and keep them at full strength all the way up to the zenith. The old
+    // upper term smoothstep(0.85,0.4,...) zeroed clouds above ~24° elevation,
+    // which left them only in a thin band around the horizon ("ring, none
+    // above"). A cloud dome should be densest directly overhead.
+    float verticalFade = smoothstep(0.03, 0.16, viewDir.y);
 
     if (cloudType < 0.5) {
         // Cumulus — billowy, rounded
