@@ -1,30 +1,24 @@
-# General Performance Benchmark — Where Giants Rust
+# General Performance Benchmark — Where Giants Rust (Hybrid Render Pipeline)
 **Date recorded:** 2026-07-01
 **Engine phase:** Phase 0 (pre-optimization baseline)
 **Source data:** `general_performance_benchmark.csv`
 
 ---
 
-> **NOTE: This game is currently unoptimized. No performance passes have been done as of
-> Phase 0. These figures represent baseline/pre-optimization state and should not be taken
-> as target performance.**
+> **NOTE: The engine is entirely unoptimized as of Phase 0. These figures represent raw baseline performance and are not target metrics.**
 
 ---
 
 ## What this benchmark measures
 
-This is the **headless terrain-streaming benchmark** (`--benchmark` mode). It launches the
-engine with a hidden window, generates a world, then teleports through multiple positions to
-stress-test chunk streaming and rendering at various distances and biome types.
+This is the headless terrain-streaming benchmark (`--benchmark` mode). It launches with a hidden window, generates a world, and teleports through multiple positions to stress-test chunk streaming and rendering across various distances and biomes.
 
 **This benchmark does NOT cover:**
-- NPC / AI load (no NPCs are spawned)
+- NPC / AI load (no NPCs spawned)
 - Settlement mesh rendering
-- Per-subsystem bucket timings (Render / Terrain / Vegetation / Physics / AI / UI) — those
-  require the debug-server build and the stress scenario in `docs/PERF_BASELINE.md`
+- Per-subsystem bucket timings (Render / Terrain / Vegetation / Physics / AI / UI)
 
-It is a good proxy for **raw terrain and rendering throughput** but is not the full
-stress scenario.
+It serves as a proxy for raw terrain and rendering throughput, not a full simulation stress test.
 
 ---
 
@@ -34,7 +28,7 @@ stress scenario.
 |---------------------|---------------|
 | Total frames        | 11,558        |
 | Total duration      | 60.0 s        |
-| Steady-state frames | 11,160 (after first 5 s loading spike excluded) |
+| Steady-state frames | 11,160 (excludes first 5s) |
 | Reference hardware  | [TBD — record your GPU/CPU here]              |
 | Resolution          | [TBD]                                         |
 
@@ -42,9 +36,7 @@ stress scenario.
 
 ## Frame time — steady state (t > 5 s)
 
-The first ~5 seconds are excluded from these figures; that window contains the initial
-world-generation and chunk-upload spike (worst single frame: **250.0 ms at t = 0.8 s**,
-which is normal engine startup behaviour, not a gameplay stutter).
+The first 5 seconds are excluded from steady-state figures to filter out the initial world-gen and chunk upload spike (worst single frame: **250.0 ms at t = 0.8 s**).
 
 | Statistic       | Frame time (ms) | Equivalent FPS |
 |-----------------|-----------------|----------------|
@@ -64,28 +56,22 @@ which is normal engine startup behaviour, not a gameplay stutter).
 | p5 low        | 154.5 |
 | Peak          | 273.1 |
 
-The **p1 low of 130.7 FPS** means the bottom 1% of frames still clear 60 FPS comfortably,
-which is a healthy sign even in this unoptimized state.
-
 ---
 
 ## Stutter analysis — steady state
 
 | Threshold                   | Count | % of frames |
 |-----------------------------|-------|-------------|
-| > 33.3 ms  (below 30 FPS)  | 10    | 0.1%        |
-| > 100 ms   (visible hitch) | 0     | 0.0%        |
+| > 33.3 ms  (below 30 FPS)   | 10    | 0.1%        |
+| > 100 ms   (visible hitch)  | 0     | 0.0%        |
 
-10 frames breached the 30 FPS threshold during steady state. The worst of those was
-**75.3 ms**, which is likely a single-frame GPU upload stall during a chunk LOD transition.
-Zero hitches above 100 ms in steady state is a good result at this stage.
+10 frames breached the 33.3 ms threshold during steady state. The worst of those was **75.3 ms**, likely a single-frame GPU upload stall during a chunk LOD transition. 
 
 ---
 
 ## Per-10-second window breakdown
 
-The benchmark teleports through multiple world positions; the window table shows how
-performance evolves as chunks stream in and out.
+This table tracks performance evolution as chunks stream in and out while teleporting.
 
 | Window   | Avg FPS | p95 ms | Peak Loaded | Peak Drawn | Peak Pending | Peak Vertices | Peak Trees |
 |----------|---------|--------|-------------|------------|--------------|---------------|------------|
@@ -97,12 +83,7 @@ performance evolves as chunks stream in and out.
 | 50–60 s  | 241.1   | 4.78   | 19          | 16         | 22           | 281,664       | 133        |
 | 60–70 s  | 101.7   | 9.84   | 19          | 16         | 17           | 281,664       | 20         |
 
-**Reading the table:**
-
-The 0–20 s window is the heaviest load: 289 chunks loaded, 115 drawn, ~1.76 M vertices,
-1,157 trees — and the engine still sustains ~150–160 FPS. FPS climbs steadily as the
-benchmark moves to lower-density positions and fewer chunks need to be held in memory.
-The 60–70 s dip to ~102 FPS is the benchmark winding down and unloading chunks.
+The 0–20 s window handles the heaviest load (289 chunks loaded, ~1.76M vertices) while sustaining ~150 FPS. The dip to ~102 FPS at 60–70 s is benchmark teardown/chunk unloading.
 
 ---
 
@@ -118,8 +99,7 @@ The 60–70 s dip to ~102 FPS is the benchmark winding down and unloading chunks
 | Veg chunks      | 8       | 30      |
 | Trees           | 268     | 1,157   |
 
-**Cull rate:** at peak load, 175 of 289 chunks (60%) are frustum-culled. That's expected —
-the culler is working. Drawn chunks stay at roughly 40% of loaded at all times.
+Frustum culling handles ~60% of chunks at peak load (175 of 289). Drawn chunks hover consistently at ~40% of loaded chunks.
 
 ---
 
@@ -127,27 +107,15 @@ the culler is working. Drawn chunks stay at roughly 40% of loaded at all times.
 
 | Area                    | Status                                                     |
 |-------------------------|------------------------------------------------------------|
-| Frame rate floor        | ✅ Well above 60 FPS target at all terrain loads tested     |
-| p99 frame time          | ✅ 7.64 ms — comfortably within 16.67 ms budget             |
-| Stutter rate            | ✅ 0.1% of frames — very low                               |
+| Frame rate floor        | ✅ Well above 60 FPS target at all terrain loads tested    |
+| p99 frame time          | ✅ 7.64 ms — comfortably within 16.67 ms budget            |
+| Stutter rate            | ✅ 0.1% of frames                                          |
 | Zero 100 ms+ hitches    | ✅ No hard hitches in steady state                         |
-| Initial load spike      | ⚠️  250 ms at t = 0.8 s — normal but worth monitoring      |
-| 75 ms spike (steady)    | ⚠️  One frame; likely a chunk upload stall — investigate if it recurs |
-| NPC / AI load           | ❓ Not measured here — see `docs/PERF_BASELINE.md` stress scenario |
-| Subsystem buckets       | ❓ Not available in this run — requires debug-server build  |
+| Initial load spike      | ⚠️  250 ms at t = 0.8 s                                    |
+| 75 ms spike (steady)    | ⚠️  One frame; likely a chunk upload stall                 |
+| NPC / AI load           | ❓ Not measured yet                                        |
+| Subsystem buckets       | ❓ Not available in this run                               |
 
 **Overall:** the engine handles terrain streaming well in this unoptimized Phase 0 state.
 The main unknowns are NPC/AI cost and per-subsystem breakdown under the full stress scenario.
-Those should be the next measurement priority.
-
----
-
-## Next steps
-
-1. Record hardware used for this run (GPU, CPU, RAM, resolution) and fill in the
-   [TBD] fields above.
-2. Run the full stress scenario from `docs/PERF_BASELINE.md` (48 NPCs, settlement plaza,
-   midday) with the debug-server build to get per-subsystem bucket numbers.
-3. Fill in the baseline tables in `docs/PERF_BASELINE.md` once both datasets exist.
-4. Re-run this benchmark after any major Phase (1, 2, 3 …) and diff the window table
-   to catch terrain regressions early.
+Those will be the next measurement priority.
